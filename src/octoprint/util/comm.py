@@ -218,7 +218,18 @@ class MachineCom(object):
 		self._regex_repetierTempExtr = re.compile("TargetExtr([0-9]+):(%s)" % positiveFloatPattern)
 		self._regex_repetierTempBed = re.compile("TargetBed:(%s)" % positiveFloatPattern)
 
+		# Regex matching position responses in line
+		# - 1: current X
+		# - 2: current Y
+		# - 3: current Z
+		# - 4: current E
+		self._regex_position = re.compile("X:([-+]?\d*\.?\d+)\s*Y:([-+]?\d*\.?\d+)\s*Z:([-+]?\d*\.?\d+)\s*E:([-+]?\d*\.?\d+)")
+		self._last_known_position = dict(x=None, y=None, z=None, e=None)
+
 		self._long_running_commands = settings().get(["serial", "longRunningCommands"])
+
+		self._response_callback = []
+		self._response_callback_regex = None
 
 		# multithreading locks
 		self._sendNextLock = threading.Lock()
@@ -427,7 +438,7 @@ class MachineCom(object):
 	def fakeOk(self):
 		self._clear_to_send.set()
 
-	def sendCommand(self, cmd, cmd_type=None, processed=False):
+	def sendCommand(self, cmd, cmd_type=None, processed=False, callback=None):
 		cmd = cmd.encode('ascii', 'replace')
 		if not processed:
 			cmd = process_gcode_line(cmd)
@@ -435,9 +446,9 @@ class MachineCom(object):
 				return
 
 		if self.isPrinting() and not self.isSdFileSelected():
-			self._commandQueue.put((cmd, cmd_type))
+			self._commandQueue.put((cmd, cmd_type, callback))
 		elif self.isOperational():
-			self._sendCommand(cmd, cmd_type=cmd_type)
+			self._sendCommand(cmd, cmd_type=cmd_type, callback=None)
 
 	def sendGcodeScript(self, scriptName, replacements=None):
 		context = dict()
@@ -648,6 +659,10 @@ class MachineCom(object):
 			self._changeState(self.STATE_PAUSED)
 			if self.isSdFileSelected():
 				self.sendCommand("M25") # pause print
+
+			self.sendCommand("G4 S0")
+			self.sendCommand("M114")
+
 			self.sendGcodeScript("afterPrintPaused", replacements=dict(event=payload))
 
 			eventManager().fire(Events.PRINT_PAUSED, payload)
@@ -707,6 +722,10 @@ class MachineCom(object):
 		self._callback.on_comm_sd_files(self._sdFiles)
 
 	##~~ communication monitoring and handling
+
+	def _register_response_callback(self, pattern, callback):
+		self._response_callback[pattern].append(callback)
+		self._response_callback_regex = re.compile()
 
 	def _parseTemperatures(self, line):
 		result = {}
@@ -921,6 +940,17 @@ class MachineCom(object):
 							self._callback.on_comm_temperature_update(self._temp, self._bedTemp)
 						except ValueError:
 							pass
+
+				##~~ process position responses
+				if 'X:' in line:
+					position_match = self._regex_position.search(line)
+					if position_match is not None:
+						self._last_known_position = dict(
+							x=position_match.group(1),
+							y=position_match.group(2),
+							z=position_match.group(3),
+							e=position_match.group(4)
+						)
 
 				#If we are waiting for an M109 or M190 then measure the time we lost during heatup, so we can remove that time from our printing time estimate.
 				if 'ok' in line and self._heatupWaitStartTime:
@@ -1199,14 +1229,15 @@ class MachineCom(object):
 		if not self._commandQueue.empty() and not self.isStreaming():
 			entry = self._commandQueue.get()
 			if isinstance(entry, tuple):
-				if not len(entry) == 2:
+				if not len(entry) == 3:
 					return False
-				cmd, cmd_type = entry
+				cmd, cmd_type, callback = entry
 			else:
 				cmd = entry
 				cmd_type = None
+				callback = None
 
-			self._sendCommand(cmd, cmd_type=cmd_type)
+			self._sendCommand(cmd, cmd_type=cmd_type, callback=callback)
 			return True
 		else:
 			return False
@@ -1426,7 +1457,7 @@ class MachineCom(object):
 				self._lastResendNumber = None
 				self._currentResendCount = 0
 
-	def _sendCommand(self, cmd, cmd_type=None):
+	def _sendCommand(self, cmd, cmd_type=None, callback=None):
 		# Make sure we are only handling one sending job at a time
 		with self._sendingLock:
 			if self._serial is None:
@@ -1446,7 +1477,7 @@ class MachineCom(object):
 					eventManager().fire(gcodeToEvent[gcode])
 
 			# actually enqueue the command for sending
-			self._enqueue_for_sending(cmd, command_type=cmd_type)
+			self._enqueue_for_sending(cmd, command_type=cmd_type, callback=callback)
 
 			if not self.isStreaming():
 				# trigger the "queued" phase only if we are not streaming to sd right now
@@ -1473,7 +1504,7 @@ class MachineCom(object):
 
 	##~~ send loop handling
 
-	def _enqueue_for_sending(self, command, linenumber=None, command_type=None):
+	def _enqueue_for_sending(self, command, linenumber=None, command_type=None, callback=None):
 		"""
 		Enqueues a command an optional linenumber to use for it in the send queue.
 
@@ -1484,7 +1515,7 @@ class MachineCom(object):
 		"""
 
 		try:
-			self._send_queue.put((command, linenumber, command_type))
+			self._send_queue.put((command, linenumber, command_type, callback))
 		except TypeAlreadyInQueue as e:
 			self._logger.debug("Type already in queue: " + e.type)
 
@@ -1506,7 +1537,7 @@ class MachineCom(object):
 					break
 
 				# fetch command and optional linenumber from queue
-				command, linenumber, command_type = entry
+				command, linenumber, command_type, callback = entry
 
 				# some firmwares (e.g. Smoothie) might support additional in-band communication that will not
 				# stick to the acknowledgement behaviour of GCODE, so we check here if we have a GCODE command
@@ -1525,6 +1556,9 @@ class MachineCom(object):
 					if command is None:
 						# so no, we are not going to send this, that was a last-minute bail, let's fetch the next item from the queue
 						continue
+
+					if callback is not None and isinstance(callback, tuple) and len(callback) == 2:
+
 
 					# now comes the part where we increase line numbers and send stuff - no turning back now
 					if (gcode is not None or self._sendChecksumWithUnknownCommands) and (self.isPrinting() or self._alwaysSendChecksum):
