@@ -228,8 +228,7 @@ class MachineCom(object):
 
 		self._long_running_commands = settings().get(["serial", "longRunningCommands"])
 
-		self._response_callback = []
-		self._response_callback_regex = None
+		self._response_callbacks = list()
 
 		# multithreading locks
 		self._sendNextLock = threading.Lock()
@@ -723,9 +722,17 @@ class MachineCom(object):
 
 	##~~ communication monitoring and handling
 
-	def _register_response_callback(self, pattern, callback):
-		self._response_callback[pattern].append(callback)
-		self._response_callback_regex = re.compile()
+	def _register_response_callback(self, pattern, callback, callback_args=None, callback_kwargs=None):
+		if not isinstance(pattern, re.RegexObject):
+			try:
+				regex = re.compile(pattern)
+			except Exception as e:
+				self._logger.warn("Error compilng regex pattern {} for callback {}: {}".format(pattern, callback, str(e)))
+				return
+		else:
+			regex = pattern
+
+		self._response_callbacks.append((regex, pattern, callback, callback_args, callback_kwargs))
 
 	def _parseTemperatures(self, line):
 		result = {}
@@ -1046,6 +1053,9 @@ class MachineCom(object):
 						# something went wrong while feedback matching
 						self._logger.exception("Error while trying to apply feedback control matching, disabling it")
 						feedback_errors.append("_all")
+
+				##~~ Parsing for registered regexes
+
 
 				##~~ Parsing for pause triggers
 				if pause_triggers and not self.isStreaming():
@@ -1557,8 +1567,15 @@ class MachineCom(object):
 						# so no, we are not going to send this, that was a last-minute bail, let's fetch the next item from the queue
 						continue
 
-					if callback is not None and isinstance(callback, tuple) and len(callback) == 2:
+					if callback is not None and isinstance(callback, tuple) and len(callback) >= 2:
+						callback_regex = callback[0]
+						callback_func = callback[1]
 
+						if not isinstance(callback_regex, re.RegexObject):
+							try:
+								callback_regex = re.compile(callback_regex)
+							except Exception as e:
+								self._logger.warn("Error compiling regex from callback {}: {}".format(callback_regex, str(e)))
 
 					# now comes the part where we increase line numbers and send stuff - no turning back now
 					if (gcode is not None or self._sendChecksumWithUnknownCommands) and (self.isPrinting() or self._alwaysSendChecksum):
