@@ -155,7 +155,11 @@ class FileManager(object):
 		self._slicing_progress_callbacks.append(callback)
 
 	def unregister_slicingprogress_callback(self, callback):
-		self._slicing_progress_callbacks.remove(callback)
+		try:
+			self._slicing_progress_callbacks.remove(callback)
+		except ValueError:
+			# callback was not registered
+			pass
 
 	def _determine_analysis_backlog(self, storage_type, storage_manager):
 		counter = 0
@@ -314,7 +318,12 @@ class FileManager(object):
 			printer_profile = self._printer_profile_manager.get_current_or_default()
 
 		for hook in self._preprocessor_hooks.values():
-			hook_file_object = hook(path, file_object, links=links, printer_profile=printer_profile, allow_overwrite=allow_overwrite)
+			try:
+				hook_file_object = hook(path, file_object, links=links, printer_profile=printer_profile, allow_overwrite=allow_overwrite)
+			except:
+				self._logger.exception("Error when calling preprocessor hook {}, ignoring".format(hook))
+				continue
+
 			if hook_file_object is not None:
 				file_object = hook_file_object
 		file_path = self._storage(destination).add_file(path, file_object, links=links, printer_profile=printer_profile, allow_overwrite=allow_overwrite)

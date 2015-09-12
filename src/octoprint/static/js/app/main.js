@@ -51,6 +51,7 @@ $(function() {
         //~~ Initialize PNotify
 
         PNotify.prototype.options.styling = "bootstrap2";
+        PNotify.prototype.options.mouse_reset = false;
 
         //~~ Initialize view models
 
@@ -58,7 +59,7 @@ $(function() {
         var viewModelMap = {};
 
         // Fix Function#name on browsers that do not support it (IE):
-        // see: http://stackoverflow.com/questions/6903762/function-name-not-supported-in-ie 
+        // see: http://stackoverflow.com/questions/6903762/function-name-not-supported-in-ie
         if (!(function f() {}).name) {
             Object.defineProperty(Function.prototype, 'name', {
                 get: function() {
@@ -320,7 +321,7 @@ $(function() {
                         .data("contextParent", $(this))
                         .show()
                         .css({
-                            position: "absolute",
+                            position: "fixed",
                             left: getMenuPosition(e.clientX, 'width', 'scrollLeft'),
                             top: getMenuPosition(e.clientY, 'height', 'scrollTop'),
                             "z-index": 9999
@@ -365,23 +366,13 @@ $(function() {
         tabs.on('show', function (e) {
             var current = e.target.hash;
             var previous = e.relatedTarget.hash;
-
-            _.each(allViewModels, function(viewModel) {
-                if (viewModel.hasOwnProperty("onTabChange")) {
-                    viewModel.onTabChange(current, previous);
-                }
-            });
+            callViewModels(allViewModels, "onTabChange", [current, previous]);
         });
 
         tabs.on('shown', function (e) {
             var current = e.target.hash;
             var previous = e.relatedTarget.hash;
-
-            _.each(allViewModels, function(viewModel) {
-                if (viewModel.hasOwnProperty("onAfterTabChange")) {
-                    viewModel.onAfterTabChange(current, previous);
-                }
-            });
+            callViewModels(allViewModels, "onAfterTabChange", [current, previous]);
         });
 
         // Fix input element click problems on dropdowns
@@ -396,11 +387,7 @@ $(function() {
 
         //~~ Starting up the app
 
-        _.each(allViewModels, function(viewModel) {
-            if (viewModel.hasOwnProperty("onStartup")) {
-                viewModel.onStartup();
-            }
-        });
+        callViewModels(allViewModels, "onStartup");
 
         //~~ view model binding
 
@@ -431,6 +418,8 @@ $(function() {
                         targets = [targets];
                     }
 
+                    viewModel._bindings = [];
+
                     _.each(targets, function(target) {
                         if (target == undefined) {
                             return;
@@ -456,6 +445,12 @@ $(function() {
 
                         try {
                             ko.applyBindings(viewModel, element);
+                            viewModel._bindings.push(target);
+
+                            if (viewModel.hasOwnProperty("onBoundTo")) {
+                                viewModel.onBoundTo(target, element);
+                            }
+
                             log.debug("View model", viewModel.constructor.name, "bound to", target);
                         } catch (exc) {
                             log.error("Could not bind view model", viewModel.constructor.name, "to target", target, ":", (exc.stack || exc));
@@ -463,23 +458,17 @@ $(function() {
                     });
                 }
 
+                viewModel._unbound = viewModel._bindings != undefined && viewModel._bindings.length == 0;
+
                 if (viewModel.hasOwnProperty("onAfterBinding")) {
                     viewModel.onAfterBinding();
                 }
             });
 
-            _.each(allViewModels, function(viewModel) {
-                if (viewModel.hasOwnProperty("onAllBound")) {
-                    viewModel.onAllBound(allViewModels);
-                }
-            });
+            callViewModels(allViewModels, "onAllBound", [allViewModels]);
             log.info("... binding done");
 
-            _.each(allViewModels, function(viewModel) {
-                if (viewModel.hasOwnProperty("onStartupComplete")) {
-                    viewModel.onStartupComplete();
-                }
-            });
+            callViewModels(allViewModels, "onStartupComplete");
         };
 
         if (!_.has(viewModelMap, "settingsViewModel")) {

@@ -12,6 +12,12 @@ way and could be extracted into a separate Python module in the future.
 .. autoclass:: Plugin
    :members:
 
+.. autoclass:: RestartNeedingPlugin
+   :members:
+
+.. autoclass:: SortablePlugin
+   :members:
+
 """
 
 from __future__ import absolute_import
@@ -23,7 +29,7 @@ __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms
 
 import os
 import imp
-from collections import defaultdict, namedtuple
+from collections import defaultdict, namedtuple, OrderedDict
 import logging
 
 import pkg_resources
@@ -449,9 +455,10 @@ class PluginManager(object):
 
 		self.enabled_plugins = dict()
 		self.disabled_plugins = dict()
-		self.plugin_hooks = defaultdict(list)
 		self.plugin_implementations = dict()
 		self.plugin_implementations_by_type = defaultdict(list)
+
+		self._plugin_hooks = defaultdict(list)
 
 		self.implementation_injects = dict()
 		self.implementation_inject_factories = []
@@ -475,6 +482,10 @@ class PluginManager(object):
 		plugins = dict(self.enabled_plugins)
 		plugins.update(self.disabled_plugins)
 		return plugins
+
+	@property
+	def plugin_hooks(self):
+		return {key: map(lambda v: (v[1], v[2]), value) for key, value in self._plugin_hooks.items()}
 
 	def find_plugins(self, existing=None, ignore_uninstalled=True):
 		if existing is None:
@@ -779,8 +790,15 @@ class PluginManager(object):
 		plugin.hotchangeable = self.is_restart_needing_plugin(plugin)
 
 		# evaluate registered hooks
-		for hook, callback in plugin.hooks.items():
-			self.plugin_hooks[hook].append((name, callback))
+		for hook, definition in plugin.hooks.items():
+			try:
+				callback, order = self._get_callback_and_order(definition)
+			except ValueError as e:
+				self.logger.warn("There is something wrong with the hook definition {} for plugin {}: {}".format(definition, name, str(e)))
+				continue
+
+			self._plugin_hooks[hook].append((order, name, callback))
+			self._sort_hooks(hook)
 
 		# evaluate registered implementation
 		if plugin.implementation:
@@ -791,9 +809,16 @@ class PluginManager(object):
 			self.plugin_implementations[name] = plugin.implementation
 
 	def _deactivate_plugin(self, name, plugin):
-		for hook, callback in plugin.hooks.items():
+		for hook, definition in plugin.hooks.items():
 			try:
-				self.plugin_hooks[hook].remove((name, callback))
+				callback, order = self._get_callback_and_order(definition)
+			except ValueError as e:
+				self.logger.warn("There is something wrong with the hook definition {} for plugin {}: {}".format(definition, name, str(e)))
+				continue
+
+			try:
+				self._plugin_hooks[hook].remove((order, name, callback))
+				self._sort_hooks(hook)
 			except ValueError:
 				# that's ok, the plugin was just not registered for the hook
 				pass
@@ -1019,9 +1044,13 @@ class PluginManager(object):
 
 		if not hook in self.plugin_hooks:
 			return dict()
-		return {hook[0]: hook[1] for hook in self.plugin_hooks[hook]}
 
-	def get_implementations(self, *types):
+		result = OrderedDict()
+		for h in self.plugin_hooks[hook]:
+			result[h[0]] = h[1]
+		return result
+
+	def get_implementations(self, *types, **kwargs):
 		"""
 		Get all mixin implementations that implement *all* of the provided ``types``.
 
@@ -1031,6 +1060,8 @@ class PluginManager(object):
 		Returns:
 		    list: A list of all found implementations
 		"""
+
+		sorting_context = kwargs.get("sorting_context", None)
 
 		result = None
 
@@ -1042,10 +1073,28 @@ class PluginManager(object):
 				result = result.intersection(implementations)
 
 		if result is None:
-			return dict()
-		return [impl[1] for impl in result]
+			return []
 
-	def get_filtered_implementations(self, f, *types):
+		def sort_func(impl):
+			sorting_value = None
+			if sorting_context is not None and isinstance(impl[1], SortablePlugin):
+				try:
+					sorting_value = impl[1].get_sorting_key(sorting_context)
+				except:
+					self.logger.exception("Error while trying to retrieve sorting order for plugin {}".format(impl[0]))
+
+				if sorting_value is not None:
+					try:
+						int(sorting_value)
+					except ValueError:
+						self.logger.warn("The order value returned by {} for sorting context {} is not a valid integer, ignoring it".format(impl[0], sorting_context))
+						sorting_value = None
+
+			return sorting_value is None, sorting_value, impl[0]
+
+		return [impl[1] for impl in sorted(result, key=sort_func)]
+
+	def get_filtered_implementations(self, f, *types, **kwargs):
 		"""
 		Get all mixin implementation that implementat *all* of the provided ``types`` and match the provided filter `f`.
 
@@ -1058,7 +1107,7 @@ class PluginManager(object):
 		"""
 
 		assert callable(f)
-		implementations = self.get_implementations(*types)
+		implementations = self.get_implementations(*types, sorting_context=kwargs.get("sorting_context", None))
 		return filter(f, implementations)
 
 	def get_helpers(self, name, *helpers):
@@ -1117,6 +1166,32 @@ class PluginManager(object):
 		for client in self.registered_clients:
 			try: client(plugin, data)
 			except: self.logger.exception("Exception while sending plugin data to client")
+
+	def _sort_hooks(self, hook):
+		self._plugin_hooks[hook] = sorted(self._plugin_hooks[hook],
+		                                  key=lambda x: (x[0] is None, x[0], x[1], x[2]))
+
+	def _get_callback_and_order(self, hook):
+		if callable(hook):
+			return hook, None
+
+		elif isinstance(hook, tuple) and len(hook) == 2:
+			callback, order = hook
+
+			# test that callback is a callable
+			if not callable(callback):
+				raise ValueError("Hook callback is not a callable")
+
+			# test that number is an int
+			try:
+				int(order)
+			except ValueError:
+				raise ValueError("Hook order is not a number")
+
+			return callback, order
+
+		else:
+			raise ValueError("Invalid hook definition, neither a callable nor a 2-tuple (callback, order): {!r}".format(hook))
 
 
 class InstalledEntryPoint(pkginfo.Installed):
@@ -1211,17 +1286,45 @@ class Plugin(object):
 		pass
 
 class RestartNeedingPlugin(Plugin):
-	pass
+	"""
+	Mixin for plugin types that need a restart in order to be enabled.
+	"""
 
-class PluginNeedsRestart(BaseException):
+class SortablePlugin(Plugin):
+	"""
+	Mixin for plugin types that are sortable.
+	"""
+
+	def get_sorting_key(self, context=None):
+		"""
+		Returns the sorting key to use for the implementation in the specified ``context``.
+
+		May return ``None`` if order is irrelevant.
+
+		Implementations returning None will be ordered by plugin identifier
+		after all implementations which did return a sorting key value that was
+		not None sorted by that.
+
+		Arguments:
+		    context (str): The sorting context for which to provide the
+		        sorting key value.
+
+		Returns:
+		    int or None: An integer signifying the sorting key value of the plugin
+		        (sorting will be done ascending), or None if the implementation
+		        doesn't care about calling order.
+		"""
+		return None
+
+class PluginNeedsRestart(Exception):
 	def __init__(self, name):
-		BaseException.__init__(self)
+		Exception.__init__(self)
 		self.name = name
 		self.message = "Plugin {name} cannot be enabled or disabled after system startup".format(**locals())
 
-class PluginLifecycleException(BaseException):
+class PluginLifecycleException(Exception):
 	def __init__(self, name, reason, message):
-		BaseException.__init__(self)
+		Exception.__init__(self)
 		self.name = name
 		self.reason = reason
 
