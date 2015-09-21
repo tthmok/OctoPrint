@@ -15,7 +15,7 @@ import logging
 import serial
 import octoprint.plugin
 
-from collections import deque
+from collections import deque, defaultdict
 
 from octoprint.util.avr_isp import stk500v2
 from octoprint.util.avr_isp import ispBase
@@ -49,8 +49,9 @@ regexes_parameters = dict(
 	floatP=re.compile("(^|[^A-Za-z])[Pp](?P<value>%s)" % regex_float_pattern),
 	floatS=re.compile("(^|[^A-Za-z])[Ss](?P<value>%s)" % regex_float_pattern),
 	floatZ=re.compile("(^|[^A-Za-z])[Zz](?P<value>%s)" % regex_float_pattern),
+	floatF=re.compile("(^|[^A-Za-z])[Ff](?P<value>%s)" % regex_float_pattern),
 	intN=re.compile("(^|[^A-Za-z])[Nn](?P<value>%s)" % regex_int_pattern),
-	intT=re.compile("(^|[^A-Za-z])[Tt](?P<value>%s)" % regex_int_pattern)
+	intT=re.compile("(^|[^A-Za-z])[Tt](?P<value>%s)" % regex_int_pattern),
 )
 """Regexes for parsing various GCODE command parameters."""
 
@@ -102,6 +103,17 @@ regex_repetierTempBed = re.compile("TargetBed:(?P<target>%s)" % regex_positive_f
 Groups will be as follows:
 
   * ``target``: new target temperature (float)
+"""
+
+regex_position = re.compile("X:(?P<x>{float})\s*Y:(?P<y>{float})\s*Z:(?P<z>{float})\s*E:(?P<e>{float})".format(float=regex_float_pattern))
+"""Regex for matching position responses to M114.
+
+Groups will be as follows:
+
+  * ``x``: X coordinate (float)
+  * ``y``: Y coordinate (float)
+  * ``z``: Z coordinate (float)
+  * ``e``: E coordinate (float)
 """
 
 def serialList():
@@ -286,19 +298,15 @@ class MachineCom(object):
 		# print job
 		self._currentFile = None
 
-		# regexes
-
-		# Regex matching position responses in line
-		# - 1: current X
-		# - 2: current Y
-		# - 3: current Z
-		# - 4: current E
-		self._regex_position = re.compile("X:([-+]?\d*\.?\d+)\s*Y:([-+]?\d*\.?\d+)\s*Z:([-+]?\d*\.?\d+)\s*E:([-+]?\d*\.?\d+)")
 		self._last_known_position = dict(x=None, y=None, z=None, e=None)
+		self._last_known_f = dict(x=None, y=None, z=None, e=None)
+		self._last_known_printing_position = dict(x=None, y=None, z=None, e=None)
+		self._last_known_printing_f = dict(x=None, y=None, z=None, e=None)
 
 		self._long_running_commands = settings().get(["serial", "longRunningCommands"])
 
-		self._response_callbacks = list()
+		self._response_callbacks = defaultdict(lambda: dict(pattern=None, callbacks=list()))
+		self._response_matcher = None
 
 		# multithreading locks
 		self._sendNextLock = threading.Lock()
@@ -315,6 +323,19 @@ class MachineCom(object):
 		self.sending_thread = threading.Thread(target=self._send_loop, name="comm.sending_thread")
 		self.sending_thread.daemon = True
 		self.sending_thread.start()
+
+		### TODO remove
+		def update_position(line, match, *args, **kwargs):
+			self._last_known_position = dict(
+				x=float(match.group("x")),
+				y=float(match.group("y")),
+				z=float(match.group("z")),
+				e=float(match.group("e"))
+			)
+			self._logger.info("Updated position: {}".format(self._last_known_position))
+
+		self._register_response_callback(regex_position, update_position, onetime=False)
+		### /TODO remove
 
 	def __del__(self):
 		self.close()
@@ -574,7 +595,9 @@ class MachineCom(object):
 		if replacements is not None and isinstance(replacements, dict):
 			context.update(replacements)
 		context.update(dict(
-			printer_profile=self._printerProfileManager.get_current_or_default()
+			printer_profile=self._printerProfileManager.get_current_or_default(),
+			last_pos=self._last_known_position,
+			last_f=self._last_known_f
 		))
 
 		template = settings().loadScript("gcode", scriptName, context=context)
@@ -779,8 +802,12 @@ class MachineCom(object):
 			if self.isSdFileSelected():
 				self.sendCommand("M25") # pause print
 
-			self.sendCommand("G4 S0")
-			self.sendCommand("M114")
+			def update_printing_position(line, match, *args, **kwargs):
+				self._last_known_printing_position.update({(k, float(v)) for k, v in match.groupdict.items() if k in ("x", "y", "z", "e")})
+				self._logger.info("Updated printing position: {}".format(self._last_known_printing_position))
+
+			self.sendCommand("M400")
+			self.sendCommand("M114", callback=(regex_position, update_printing_position))
 
 			self.sendGcodeScript("afterPrintPaused", replacements=dict(event=payload))
 
@@ -851,6 +878,56 @@ class MachineCom(object):
 		self.sendCommand("M110 N%d" % number)
 
 	##~~ communication monitoring and handling
+
+	def _register_response_callback(self, pattern, callback, callback_args=None, callback_kwargs=None, onetime=True):
+		if isinstance(pattern, basestring):
+			try:
+				regex = re.compile(pattern)
+			except Exception as e:
+				self._logger.warn("Error compilng regex pattern {} for callback {}: {}".format(pattern, callback, str(e)))
+				return
+		elif hasattr(pattern, "pattern"):
+			regex = pattern
+			pattern = regex.pattern
+		else:
+			return
+
+		if callback_args is None:
+			callback_args = list()
+		if callback_kwargs is None:
+			callback_kwargs = dict()
+
+		from hashlib import md5
+		hash = md5()
+		hash.update(pattern)
+		key = hash.hexdigest()
+
+		self._response_callbacks[key]["pattern"] = pattern
+		self._response_callbacks[key]["callbacks"].append((regex, callback, callback_args, callback_kwargs, onetime))
+		self._update_response_matcher()
+
+	def _unregister_response_callback(self, pattern, callback):
+		if hasattr(pattern, "pattern"):
+			pattern = pattern.pattern
+		elif not isinstance(pattern, basestring):
+			return
+
+		from hashlib import md5
+		hash = md5()
+		hash.update(pattern)
+		key = hash.hexdigest()
+
+		if not key in self._response_callbacks:
+			return
+
+		self._response_callbacks[key] = filter(lambda e: e[0] != callback, self._response_callbacks[key]["callbacks"])
+		if not self._response_callbacks[key]["callbacks"]:
+			del self._response_callbacks[key]
+		self._update_response_matcher()
+
+	def _update_response_matcher(self):
+		matcher_regex = "|".join(map(lambda x: "(?P<group{}>{})".format(x[0], x[1]["pattern"]), self._response_callbacks.items()))
+		self._response_matcher = re.compile(matcher_regex)
 
 	def _processTemperatures(self, line):
 		current_tool = self._currentTool if self._currentTool is not None else 0
@@ -1027,17 +1104,6 @@ class MachineCom(object):
 						except ValueError:
 							pass
 
-				##~~ process position responses
-				if 'X:' in line:
-					position_match = self._regex_position.search(line)
-					if position_match is not None:
-						self._last_known_position = dict(
-							x=position_match.group(1),
-							y=position_match.group(2),
-							z=position_match.group(3),
-							e=position_match.group(4)
-						)
-
 				#If we are waiting for an M109 or M190 then measure the time we lost during heatup, so we can remove that time from our printing time estimate.
 				if 'ok' in line and self._heatupWaitStartTime:
 					self._heatupWaitTimeLost = self._heatupWaitTimeLost + (time.time() - self._heatupWaitStartTime)
@@ -1134,7 +1200,33 @@ class MachineCom(object):
 						feedback_errors.append("_all")
 
 				##~~ Parsing for registered regexes
+				if self._response_callbacks and self._response_matcher:
+					match = self._response_matcher.search(line)
+					if match:
+						for match_key in match.groupdict():
+							if not match_key.startswith("group"):
+								continue
 
+							match_key = match_key[len("group"):]
+							if not match_key in self._response_callbacks:
+								continue
+
+							pattern = self._response_callbacks[match_key]["pattern"]
+							entries = self._response_callbacks[match_key]["callbacks"]
+							for entry in entries:
+								regex, callback, callback_args, callback_kwargs, onetime = entry
+
+								group_match = regex.search(line)
+								if group_match is None:
+									continue
+
+								try:
+									callback(line, group_match, *callback_args, **callback_kwargs)
+								except:
+									self._logger.exception("Error while executing callback {} for line {}".format(callback, line))
+
+								if onetime:
+									self._unregister_response_callback(pattern, callback)
 
 				##~~ Parsing for pause triggers
 				if pause_triggers and not self.isStreaming():
@@ -1578,7 +1670,7 @@ class MachineCom(object):
 			gcode = None
 			if not self.isStreaming():
 				# trigger the "queuing" phase only if we are not streaming to sd right now
-				cmd, cmd_type, gcode = self._process_command_phase("queuing", cmd, cmd_type, gcode=gcode)
+				cmd, cmd_type, gcode, callback = self._process_command_phase("queuing", cmd, cmd_type, gcode=gcode, callback=callback)
 
 				if cmd is None:
 					# command is no more, return
@@ -1593,7 +1685,7 @@ class MachineCom(object):
 
 			if not self.isStreaming():
 				# trigger the "queued" phase only if we are not streaming to sd right now
-				self._process_command_phase("queued", cmd, cmd_type, gcode=gcode)
+				self._process_command_phase("queued", cmd, cmd_type, gcode=gcode, callback=callback)
 
 	##~~ send loop handling
 
@@ -1645,25 +1737,36 @@ class MachineCom(object):
 
 					else:
 						# trigger "sending" phase
-						command, _, gcode = self._process_command_phase("sending", command, command_type, gcode=gcode)
+						command, _, gcode, callback = self._process_command_phase("sending", command, command_type, gcode=gcode, callback=callback)
 
 						if command is None:
 							# so no, we are not going to send this, that was a last-minute bail, let's fetch the next item from the queue
+							continue
+
+						if command.strip() == "":
+							self._logger.info("Refusing to send an empty line to the printer")
 							continue
 
 						if callback is not None and isinstance(callback, tuple) and len(callback) >= 2:
 							callback_regex = callback[0]
 							callback_func = callback[1]
 
-							if not isinstance(callback_regex, re.RegexObject):
-								try:
-									callback_regex = re.compile(callback_regex)
-								except Exception as e:
-									self._logger.warn("Error compiling regex from callback {}: {}".format(callback_regex, str(e)))
+							if callable(callback_func):
+								callback_args = list()
+								callback_kwargs = dict()
+								callback_onetime = True
+								if len(callback) >= 3:
+									callback_args = callback[2]
+								if len(callback) >= 4:
+									callback_kwargs = callback[3]
+								if len(callback) >= 5:
+									callback_onetime = callback[4]
 
-						if command.strip() == "":
-							self._logger.info("Refusing to send an empty line to the printer")
-							continue
+								self._register_response_callback(callback_regex,
+								                                 callback_func,
+								                                 callback_args=callback_args,
+								                                 callback_kwargs=callback_kwargs,
+								                                 onetime=callback_onetime)
 
 						# now comes the part where we increase line numbers and send stuff - no turning back now
 						command_requiring_checksum = gcode is not None and gcode in self._checksum_requiring_commands
@@ -1676,7 +1779,7 @@ class MachineCom(object):
 							self._doSendWithoutChecksum(command)
 
 					# trigger "sent" phase and use up one "ok"
-					self._process_command_phase("sent", command, command_type, gcode=gcode)
+					self._process_command_phase("sent", command, command_type, gcode=gcode, callback=callback)
 
 					# we only need to use up a clear if the command we just sent was either a gcode command or if we also
 					# require ack's for unknown commands
@@ -1699,9 +1802,9 @@ class MachineCom(object):
 				self._logger.exception("Caught an exception in the send loop")
 		self._log("Closing down send loop")
 
-	def _process_command_phase(self, phase, command, command_type=None, gcode=None):
+	def _process_command_phase(self, phase, command, command_type=None, gcode=None, callback=None):
 		if phase not in ("queuing", "queued", "sending", "sent"):
-			return command, command_type, gcode
+			return command, command_type, gcode, callback
 
 		if gcode is None:
 			gcode = gcode_command_for_cmd(command)
@@ -1709,33 +1812,33 @@ class MachineCom(object):
 		# send it through the phase specific handlers provided by plugins
 		for name, hook in self._gcode_hooks[phase].items():
 			try:
-				hook_result = hook(self, phase, command, command_type, gcode)
+				hook_result = hook(self, phase, command, command_type, gcode, callback=callback)
 			except:
 				self._logger.exception("Error while processing hook {name} for phase {phase} and command {command}:".format(**locals()))
 			else:
-				command, command_type, gcode = self._handle_command_handler_result(command, command_type, gcode, hook_result)
+				command, command_type, gcode, callback = self._handle_command_handler_result(command, command_type, gcode, callback, hook_result)
 				if command is None:
 					# hook handler return None as command, so we'll stop here and return a full out None result
-					return None, None, None
+					return None, None, None, None
 
 		# if it's a gcode command send it through the specific handler if it exists
 		if gcode is not None:
 			gcodeHandler = "_gcode_" + gcode + "_" + phase
 			if hasattr(self, gcodeHandler):
 				handler_result = getattr(self, gcodeHandler)(command, cmd_type=command_type)
-				command, command_type, gcode = self._handle_command_handler_result(command, command_type, gcode, handler_result)
+				command, command_type, gcode, callback = self._handle_command_handler_result(command, command_type, gcode, callback, handler_result)
 
 		# send it through the phase specific command handler if it exists
 		commandPhaseHandler = "_command_phase_" + phase
 		if hasattr(self, commandPhaseHandler):
 			handler_result = getattr(self, commandPhaseHandler)(command, cmd_type=command_type, gcode=gcode)
-			command, command_type, gcode = self._handle_command_handler_result(command, command_type, gcode, handler_result)
+			command, command_type, gcode, callback = self._handle_command_handler_result(command, command_type, gcode, callback, handler_result)
 
 		# finally return whatever we resulted on
-		return command, command_type, gcode
+		return command, command_type, gcode, callback
 
-	def _handle_command_handler_result(self, command, command_type, gcode, handler_result):
-		original_tuple = (command, command_type, gcode)
+	def _handle_command_handler_result(self, command, command_type, gcode, callback, handler_result):
+		original_tuple = (command, command_type, gcode, callback)
 
 		if handler_result is None:
 			# handler didn't return anything, we'll just continue
@@ -1755,12 +1858,15 @@ class MachineCom(object):
 		elif hook_result_length == 2:
 			# handler returned command and command_type
 			command, command_type = handler_result
+		elif hook_result_length == 3:
+			# handler returned command, command_type and callback
+			command, command_type, callback = handler_result
 		else:
 			# handler returned a tuple of an unexpected length
 			return original_tuple
 
 		gcode = gcode_command_for_cmd(command)
-		return command, command_type, gcode
+		return command, command_type, gcode, callback
 
 	##~~ actual sending via serial
 
@@ -1803,30 +1909,32 @@ class MachineCom(object):
 
 	##~~ command handlers
 
-	def _gcode_T_sent(self, cmd, cmd_type=None):
+	def _gcode_T_sent(self, cmd, cmd_type=None, *args, **kwargs):
 		toolMatch = regexes_parameters["intT"].search(cmd)
 		if toolMatch:
 			self._currentTool = int(toolMatch.group("value"))
 
-	def _gcode_G0_sent(self, cmd, cmd_type=None):
+	def _gcode_G0_sent(self, cmd, cmd_type=None, *args, **kwargs):
 		if 'Z' in cmd:
 			match = regexes_parameters["floatZ"].search(cmd)
 			if match:
-				try:
-					z = float(match.group("value"))
-					if self._currentZ != z:
-						self._currentZ = z
-						self._callback.on_comm_z_change(z)
-				except ValueError:
-					pass
+				z = float(match.group("value"))
+				if self._currentZ != z:
+					self._currentZ = z
+					self._callback.on_comm_z_change(z)
+
+		if 'F' in cmd:
+			match = regexes_parameters["floatF"].search(cmd)
+			if match:
+				self._last_known_f = float(match.group("value"))
 	_gcode_G1_sent = _gcode_G0_sent
 
-	def _gcode_M0_queuing(self, cmd, cmd_type=None):
+	def _gcode_M0_queuing(self, cmd, cmd_type=None, *args, **kwargs):
 		self.setPause(True)
 		return None, # Don't send the M0 or M1 to the machine, as M0 and M1 are handled as an LCD menu pause.
 	_gcode_M1_queuing = _gcode_M0_queuing
 
-	def _gcode_M104_sent(self, cmd, cmd_type=None):
+	def _gcode_M104_sent(self, cmd, cmd_type=None, *args, **kwargs):
 		toolNum = self._currentTool
 		toolMatch = regexes_parameters["intT"].search(cmd)
 		if toolMatch:
@@ -1843,7 +1951,7 @@ class MachineCom(object):
 			except ValueError:
 				pass
 
-	def _gcode_M140_sent(self, cmd, cmd_type=None):
+	def _gcode_M140_sent(self, cmd, cmd_type=None, *args, **kwargs):
 		match = regexes_parameters["floatS"].search(cmd)
 		if match:
 			try:
@@ -1856,19 +1964,19 @@ class MachineCom(object):
 			except ValueError:
 				pass
 
-	def _gcode_M109_sent(self, cmd, cmd_type=None):
+	def _gcode_M109_sent(self, cmd, cmd_type=None, *args, **kwargs):
 		self._heatupWaitStartTime = time.time()
 		self._long_running_command = True
 		self._heating = True
 		self._gcode_M104_sent(cmd, cmd_type)
 
-	def _gcode_M190_sent(self, cmd, cmd_type=None):
+	def _gcode_M190_sent(self, cmd, cmd_type=None, *args, **kwargs):
 		self._heatupWaitStartTime = time.time()
 		self._long_running_command = True
 		self._heating = True
 		self._gcode_M140_sent(cmd, cmd_type)
 
-	def _gcode_M110_sending(self, cmd, cmd_type=None):
+	def _gcode_M110_sending(self, cmd, cmd_type=None, *args, **kwargs):
 		newLineNumber = None
 		match = regexes_parameters["intN"].search(cmd)
 		if match:
@@ -1887,7 +1995,7 @@ class MachineCom(object):
 			self._lastLines.clear()
 		self._resendDelta = None
 
-	def _gcode_M112_queuing(self, cmd, cmd_type=None):
+	def _gcode_M112_queuing(self, cmd, cmd_type=None, *args, **kwargs):
 		# emergency stop, jump the queue with the M112
 		self._doSendWithoutChecksum("M112")
 		self._doIncrementAndSendWithChecksum("M112")
@@ -1915,7 +2023,7 @@ class MachineCom(object):
 		# I hope it got it the first time because as far as I can tell, there is no way to know
 		return None,
 
-	def _gcode_G4_sent(self, cmd, cmd_type=None):
+	def _gcode_G4_sent(self, cmd, cmd_type=None, *args, **kwargs):
 		# we are intending to dwell for a period of time, increase the timeout to match
 		p_match = regexes_parameters["floatP"].search(cmd)
 		s_match = regexes_parameters["floatS"].search(cmd)
