@@ -56,6 +56,7 @@ date of first contribution):
   * [Mark Bastiaans](https://github.com/markbastiaans)
   * [Marcel Hellwig](https://github.com/punkkeks)
   * [Kevin Murphy](https://github.com/kevingelion)
+  * [Goswin von Brederlow](https://github.com/mrvn)
   * [Richard Joyce](https://github.com/richjoyce)
 
 OctoPrint started off as a fork of [Cura](https://github.com/daid/Cura) by
