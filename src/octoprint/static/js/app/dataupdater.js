@@ -18,6 +18,9 @@ function DataUpdater(allViewModels) {
 
     self._connectCallback = undefined;
 
+    self._noMessageSeconds = 5;
+    self._noMessageTimeout = undefined;
+
     self.connect = function(callback) {
         var options = {};
         if (SOCKJS_DEBUG) {
@@ -30,6 +33,7 @@ function DataUpdater(allViewModels) {
         self._socket.onopen = self._onconnect;
         self._socket.onclose = self._onclose;
         self._socket.onmessage = self._onmessage;
+        self._socket.onheartbeat = self._onheartbeat;
     };
 
     self.reconnect = function() {
@@ -68,6 +72,7 @@ function DataUpdater(allViewModels) {
     };
 
     self._onclose = function(e) {
+        log.info("SockJS socket closed! code = " + e.code, e);
         if (e.code == SOCKJS_CLOSE_NORMAL) {
             return;
         }
@@ -132,7 +137,18 @@ function DataUpdater(allViewModels) {
         $("#offline_overlay_message").html(gettext("The server appears to be offline, at least I'm not getting any response from it. I <strong>could not reconnect automatically</strong>, but you may try a manual reconnect using the button below."));
     };
 
+    self._onheartbeat = function(e) {
+        log.info("Got a heartbeat message from SockJS", e);
+    };
+
     self._onmessage = function(e) {
+        log.info("Got a message from SockJS");
+        if (self._noMessageTimeout !== undefined) {
+            window.clearTimeout(self._noMessageTimeout);
+            self._noMessageTimeout = undefined;
+        }
+        self._noMessageTimeout = window.setTimeout(self._onnomessage, self._noMessageSeconds * 1000);
+
         for (var prop in e.data) {
             if (!e.data.hasOwnProperty(prop)) {
                 continue;
@@ -302,4 +318,8 @@ function DataUpdater(allViewModels) {
             }
         }
     };
+
+    self._onnomessage = function() {
+        log.warn("Didn't get a message from the backend for the past " + self._noMessageSeconds + " seconds, that's unusual!");
+    }
 }
