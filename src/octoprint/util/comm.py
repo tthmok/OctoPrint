@@ -4,6 +4,7 @@ __author__ = "Gina Häußge <osd@foosel.net> based on work by David Braam"
 __license__ = "GNU Affero General Public License http://www.gnu.org/licenses/agpl.html"
 __copyright__ = "Copyright (C) 2013 David Braam - Released under terms of the AGPLv3 License"
 
+import json
 
 import os
 import glob
@@ -193,6 +194,10 @@ class MachineCom(object):
 	def __init__(self, port = None, baudrate=None, callbackObject=None, printerProfileManager=None):
 		self._logger = logging.getLogger(__name__)
 		self._serialLogger = logging.getLogger("SERIAL")
+
+		self._timed_commands = []
+		self.start_gcode_time = 0
+		self._print_started = False
 
 		if port == None:
 			port = settings().get(["serial", "port"])
@@ -594,6 +599,19 @@ class MachineCom(object):
 			return self._sendCommand(cmd, cmd_type=cmd_type)
 
 	def sendGcodeScript(self, scriptName, replacements=None):
+		print("sendGcodeScript: " + scriptName)
+		if scriptName == "beforePrintStarted":
+			self.start_gcode_time = time.time()
+			self._print_started = True
+			print("beforePrintStarted: " + str(time.time()))
+		elif scriptName == "afterPrintDone":
+			print("afterPrintDone: " + str(time.time() - self.start_gcode_time))
+			self.start_gcode_time = 0
+			self._print_started = False
+			with open('data.json', 'w') as fp:
+				json.dump(self._timed_commands, fp)
+			self._timed_commands = []
+
 		context = dict()
 		if replacements is not None and isinstance(replacements, dict):
 			context.update(replacements)
@@ -1859,6 +1877,8 @@ class MachineCom(object):
 		"""
 
 		self._clear_to_send.wait()
+		#mok
+		print("START _send_loop\n")
 
 		while self._send_queue_active:
 			try:
@@ -1880,6 +1900,7 @@ class MachineCom(object):
 					gcode = gcode_command_for_cmd(command)
 
 					if linenumber is not None:
+						print("linenumber is not None\n")
 						# line number predetermined - this only happens for resends, so we'll use the number and
 						# send directly without any processing (since that already took place on the first sending!)
 						self._do_send_with_checksum(command, linenumber)
@@ -1903,13 +1924,27 @@ class MachineCom(object):
 						command_requiring_checksum = gcode is not None and gcode in self._checksum_requiring_commands
 						command_allowing_checksum = gcode is not None or self._sendChecksumWithUnknownCommands
 						checksum_enabled = self.isPrinting() or self._alwaysSendChecksum
-
 						command_to_send = command.encode("ascii", errors="replace")
 						if command_requiring_checksum or (command_allowing_checksum and checksum_enabled):
+							#mok
+							if self._print_started:
+								print("Command: " + command)
+								print("CommandType: " + str(command_type))
+								print("Time: " + str(self.start_gcode_time) + " - " + str(time.time()))
+								print("Time: " + str(time.time() - self.start_gcode_time) + "\n")
+								timed_command = {
+									"Time": str(time.time() - self.start_gcode_time),
+									"Command": command,
+									"CommandType": str(command_type)
+								}
+								self._timed_commands.append(timed_command)
+							#self._log("Time: " + str((time.time() - self.start_gcode_time)) + "\n")
 							self._do_increment_and_send_with_checksum(command_to_send)
 						else:
 							self._do_send_without_checksum(command_to_send)
 
+						
+						
 					# trigger "sent" phase and use up one "ok"
 					self._process_command_phase("sent", command, command_type, gcode=gcode)
 
@@ -2023,6 +2058,12 @@ class MachineCom(object):
 		if self._serial is None:
 			return
 
+		# mok time of gcode
+		#time_of_gcode = time.time() - self._start_time
+		#print("Send: " + str(cmd) + "\n")
+		
+		#traceback.print_stack()
+		
 		self._log("Send: " + str(cmd))
 
 		cmd += "\n"
@@ -2198,6 +2239,7 @@ class MachineCom(object):
 		self._resendDelta = None
 
 	def _gcode_M112_queuing(self, cmd, cmd_type=None):
+		print("***** _gcode_M112_queuing\n")
 		# emergency stop, jump the queue with the M112
 		self._do_send_without_checksum("M112")
 		self._do_increment_and_send_with_checksum("M112")
@@ -2305,6 +2347,7 @@ class PrintingFileInformation(object):
 		self._pos = 0
 		self._size = None
 		self._start_time = None
+		self._start_time_clock = None
 
 	def getStartTime(self):
 		return self._start_time
